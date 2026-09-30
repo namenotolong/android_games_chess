@@ -9,7 +9,7 @@ type Config struct {
 
 func Load() Config {
 	return Config{
-		HTTPAddr:     envOrDefault("HTTP_ADDR", ":8888"),
+		HTTPAddr:     envOrDefault("HTTP_ADDR", ":8083"),
 		DatabasePath: envOrDefault("DATABASE_PATH", "data/gomoku.db"),
 	}
 }
