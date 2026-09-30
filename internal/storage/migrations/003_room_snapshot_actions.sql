@@ -1,0 +1,5 @@
+ALTER TABLE rooms ADD COLUMN host_piece TEXT NOT NULL DEFAULT 'BLACK' CHECK (host_piece IN ('BLACK', 'WHITE'));
+ALTER TABLE rooms ADD COLUMN guest_piece TEXT NOT NULL DEFAULT 'WHITE' CHECK (guest_piece IN ('BLACK', 'WHITE'));
+ALTER TABLE rooms ADD COLUMN last_move_json TEXT NOT NULL DEFAULT 'null';
+ALTER TABLE rooms ADD COLUMN undo_snapshot_json TEXT NOT NULL DEFAULT 'null';
+DROP TABLE IF EXISTS moves;
