@@ -145,7 +145,7 @@ func (s *Service) Create(ctx context.Context, name string) (Session, error) {
 }
 func (s *Service) Join(ctx context.Context, code, name string) (Session, error) {
 	var id, status string
-	e := s.db.QueryRowContext(ctx, "SELECT room_id,status FROM rooms WHERE room_code=? COLLATE NOCASE", strings.TrimSpace(code)).Scan(&id, &status)
+	e := s.db.QueryRowContext(ctx, "SELECT room_id,status FROM rooms WHERE room_code=? COLLATE NOCASE AND game_type='GOMOKU'", strings.TrimSpace(code)).Scan(&id, &status)
 	if e != nil {
 		return Session{}, ErrNotFound
 	}
@@ -229,7 +229,7 @@ func (s *Service) snapshot(ctx context.Context, id string) (Snapshot, error) {
 func (s *Service) AuthorizedSnapshot(ctx context.Context, id, token string) (Snapshot, string, string, error) {
 	var pid, piece string
 	h := hashToken(token)
-	e := s.db.QueryRowContext(ctx, "SELECT CASE WHEN host_token_hash=? THEN host_player_id WHEN guest_token_hash=? THEN guest_player_id ELSE NULL END, CASE WHEN host_token_hash=? THEN host_piece WHEN guest_token_hash=? THEN guest_piece ELSE NULL END FROM rooms WHERE room_id=?", h, h, h, h, id).Scan(&pid, &piece)
+	e := s.db.QueryRowContext(ctx, "SELECT CASE WHEN host_token_hash=? THEN host_player_id WHEN guest_token_hash=? THEN guest_player_id ELSE NULL END, CASE WHEN host_token_hash=? THEN host_piece WHEN guest_token_hash=? THEN guest_piece ELSE NULL END FROM rooms WHERE room_id=? AND game_type='GOMOKU'", h, h, h, h, id).Scan(&pid, &piece)
 	if e != nil || pid == "" {
 		return Snapshot{}, "", "", ErrNotFound
 	}

@@ -27,6 +27,8 @@ func RegisterOnline(h *server.Hertz, s *game.Service, hub *game.Hub) {
 	h.POST("/api/v1/rooms/:code/join", a.join)
 	h.GET("/api/v1/matches/:id", a.snapshot)
 	h.GET("/api/v1/ws", adaptor.HertzHandler(http.HandlerFunc(a.websocket)))
+	h.POST("/api/v1/xiangqi/rooms", a.createXiangqi)
+	h.POST("/api/v1/xiangqi/rooms/:code/join", a.joinXiangqi)
 }
 func body(c *app.RequestContext, v any) error { return json.Unmarshal(c.Request.Body(), v) }
 func (a *onlineAPI) create(ctx context.Context, c *app.RequestContext) {
@@ -53,6 +55,37 @@ func (a *onlineAPI) join(ctx context.Context, c *app.RequestContext) {
 		return
 	}
 	x, e := a.s.Join(ctx, string(c.Param("code")), r.DisplayName)
+	if e != nil {
+		fail(c, e)
+		return
+	}
+	a.hub.Broadcast(x.RoomID, map[string]any{"type": "state", "match": x.Match})
+	c.JSON(200, x)
+}
+func (a *onlineAPI) createXiangqi(ctx context.Context, c *app.RequestContext) {
+	var r struct {
+		DisplayName string `json:"displayName"`
+	}
+	if body(c, &r) != nil {
+		c.JSON(400, utils.H{"error": "请求格式无效"})
+		return
+	}
+	x, e := a.s.CreateXiangqi(ctx, r.DisplayName)
+	if e != nil {
+		fail(c, e)
+		return
+	}
+	c.JSON(201, x)
+}
+func (a *onlineAPI) joinXiangqi(ctx context.Context, c *app.RequestContext) {
+	var r struct {
+		DisplayName string `json:"displayName"`
+	}
+	if body(c, &r) != nil {
+		c.JSON(400, utils.H{"error": "请求格式无效"})
+		return
+	}
+	x, e := a.s.JoinXiangqi(ctx, string(c.Param("code")), r.DisplayName)
 	if e != nil {
 		fail(c, e)
 		return
@@ -91,6 +124,10 @@ func fail(c *app.RequestContext, e error) {
 func (a *onlineAPI) websocket(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Query().Get("roomId")
 	token := r.URL.Query().Get("token")
+	if snap, pid, e := a.s.AuthorizedXiangqi(r.Context(), id, token); e == nil {
+		a.xiangqiWebsocket(w, r, id, token, pid, snap)
+		return
+	}
 	snap, pid, _, e := a.s.AuthorizedSnapshot(r.Context(), id, token)
 	if e != nil {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -134,6 +171,42 @@ func (a *onlineAPI) websocket(w http.ResponseWriter, r *http.Request) {
 			next, e = a.s.Resign(r.Context(), id, token, msg.ExpectedRevision)
 		default:
 			continue
+		}
+		if e != nil {
+			_ = client.WriteJSON(map[string]any{"type": "error", "message": e.Error()})
+			continue
+		}
+		a.hub.Broadcast(id, map[string]any{"type": "state", "match": next})
+	}
+}
+
+func (a *onlineAPI) xiangqiWebsocket(w http.ResponseWriter, r *http.Request, id, token, pid string, snap game.XiangqiSnapshot) {
+	up := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+	conn, e := up.Upgrade(w, r, nil)
+	if e != nil {
+		return
+	}
+	client := &game.Client{Conn: conn, PlayerID: pid}
+	a.hub.Add(id, client)
+	defer func() { a.hub.Remove(id, client); conn.Close() }()
+	_ = client.WriteJSON(map[string]any{"type": "state", "match": snap})
+	for {
+		var msg struct {
+			Type             string `json:"type"`
+			ExpectedRevision int64  `json:"expectedRevision"`
+			FromRow          int    `json:"fromRow"`
+			FromColumn       int    `json:"fromColumn"`
+			ToRow            int    `json:"toRow"`
+			ToColumn         int    `json:"toColumn"`
+		}
+		if conn.ReadJSON(&msg) != nil {
+			return
+		}
+		var next game.XiangqiSnapshot
+		if msg.Type == "move" {
+			next, e = a.s.PlayXiangqi(r.Context(), id, token, msg.ExpectedRevision, game.XiangqiMove{FromRow: msg.FromRow, FromColumn: msg.FromColumn, ToRow: msg.ToRow, ToColumn: msg.ToColumn})
+		} else {
+			next, e = a.s.XiangqiAction(r.Context(), id, token, msg.Type, msg.ExpectedRevision)
 		}
 		if e != nil {
 			_ = client.WriteJSON(map[string]any{"type": "error", "message": e.Error()})
