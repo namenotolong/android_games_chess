@@ -171,6 +171,29 @@ func (s *Service) Join(ctx context.Context, code, name string) (Session, error) 
 	snap, e := s.snapshot(ctx, id)
 	return Session{id, snap.RoomCode, pid, token, snap.GuestPiece, snap}, e
 }
+func (s *Service) Rejoin(ctx context.Context, code, token string) (Session, error) {
+	if token == "" {
+		return Session{}, ErrNotFound
+	}
+	var id, hostID string
+	var guestID sql.NullString
+	var hostHash, guestHash string
+	e := s.db.QueryRowContext(ctx, "SELECT room_id,host_player_id,guest_player_id,host_token_hash,guest_token_hash FROM rooms WHERE game_type='GOMOKU' AND room_code=? COLLATE NOCASE", strings.TrimSpace(code)).Scan(&id, &hostID, &guestID, &hostHash, &guestHash)
+	if e != nil {
+		return Session{}, ErrNotFound
+	}
+	th := hashToken(token)
+	switch {
+	case hostHash == th:
+		snap, e := s.snapshot(ctx, id)
+		return Session{id, snap.RoomCode, hostID, token, snap.HostPiece, snap}, e
+	case guestID.Valid && guestHash == th:
+		snap, e := s.snapshot(ctx, id)
+		return Session{id, snap.RoomCode, guestID.String, token, snap.GuestPiece, snap}, e
+	default:
+		return Session{}, ErrNotFound
+	}
+}
 func cleanName(v string) string {
 	v = strings.TrimSpace(v)
 	if v == "" {

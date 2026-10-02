@@ -23,8 +23,10 @@ Android 模拟器通过 `http://10.0.2.2:8888` 访问宿主机；实体设备需
 - `GET /healthz`：服务健康检查
 - `POST /api/v1/rooms`：创建房间，JSON `{ "displayName": "玩家" }`；返回唯一的 4 位数字房间号，号码池耗尽时返回 503 和“线上人数过多，创建失败，请稍后再试”
 - `POST /api/v1/rooms/{roomCode}/join`：加入房间，JSON `{ "displayName": "玩家" }`
+- `POST /api/v1/rooms/{roomCode}/rejoin`：重新进入已有房间，JSON `{ "playerToken": "..." }`
 - `POST /api/v1/xiangqi/rooms`：创建象棋房间
 - `POST /api/v1/xiangqi/rooms/{roomCode}/join`：加入象棋房间
+- `POST /api/v1/xiangqi/rooms/{roomCode}/rejoin`：重新进入已有象棋房间，JSON `{ "playerToken": "..." }`
 - `GET /api/v1/matches/{roomId}`：携带 `Authorization: Bearer <playerToken>` 查询对局
 - `GET /api/v1/ws?roomId={roomId}&token={playerToken}`：WebSocket 实时对局。支持 `type=move`、`restart`、`request_undo`、`request_swap_colors`、`accept_action`、`reject_action` 和 `resign`；所有修改都携带 `expectedRevision`，服务端更新 `rooms` 中的当前局快照并广播
 

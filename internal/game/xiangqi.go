@@ -16,19 +16,38 @@ type XiangqiMove struct {
 	ToColumn   int `json:"toColumn"`
 }
 type XiangqiSnapshot struct {
-	RoomID        string       `json:"roomId"`
-	RoomCode      string       `json:"roomCode"`
-	HostPlayerID  string       `json:"hostPlayerId"`
-	HostName      string       `json:"hostName"`
-	GuestPlayerID *string      `json:"guestPlayerId"`
-	GuestName     *string      `json:"guestName"`
-	Status        string       `json:"status"`
-	Board         []string     `json:"board"`
-	CurrentTurn   string       `json:"currentTurn"`
-	MoveCount     int          `json:"moveCount"`
-	Revision      int64        `json:"revision"`
-	Winner        *string      `json:"winner"`
-	LastMove      *XiangqiMove `json:"lastMove"`
+	RoomID            string         `json:"roomId"`
+	RoomCode          string         `json:"roomCode"`
+	HostPlayerID      string         `json:"hostPlayerId"`
+	HostName          string         `json:"hostName"`
+	GuestPlayerID     *string        `json:"guestPlayerId"`
+	GuestName         *string        `json:"guestName"`
+	Status            string         `json:"status"`
+	Board             []string       `json:"board"`
+	CurrentTurn       string         `json:"currentTurn"`
+	MoveCount         int            `json:"moveCount"`
+	Revision          int64          `json:"revision"`
+	Winner            *string        `json:"winner"`
+	Result            *string        `json:"result"`
+	LastMove          *XiangqiMove   `json:"lastMove"`
+	PendingAction     *PendingAction `json:"pendingAction"`
+	CanUndo           bool           `json:"canUndo"`
+	RecentMovePlayers []string       `json:"recentMovePlayers"`
+	undoSnapshot      string
+}
+type xiangqiUndoSnapshot struct {
+	Board       []string     `json:"board"`
+	CurrentTurn string       `json:"currentTurn"`
+	MoveCount   int          `json:"moveCount"`
+	LastMove    *XiangqiMove `json:"lastMove"`
+}
+type xiangqiMoveCheckpoint struct {
+	Move     XiangqiMove         `json:"move"`
+	PlayerID string              `json:"playerId"`
+	Before   xiangqiUndoSnapshot `json:"before"`
+}
+type xiangqiUndoHistory struct {
+	Moves []xiangqiMoveCheckpoint `json:"moves"`
 }
 type XiangqiSession struct {
 	RoomID      string          `json:"roomId"`
@@ -102,10 +121,33 @@ func (s *Service) JoinXiangqi(ctx context.Context, code, name string) (XiangqiSe
 	snap, e := s.xiangqiSnapshot(ctx, id)
 	return XiangqiSession{id, snap.RoomCode, pid, token, "BLACK", snap}, e
 }
+func (s *Service) RejoinXiangqi(ctx context.Context, code, token string) (XiangqiSession, error) {
+	if token == "" {
+		return XiangqiSession{}, ErrNotFound
+	}
+	var id, hostID string
+	var guestID sql.NullString
+	var hostHash, guestHash string
+	e := s.db.QueryRowContext(ctx, "SELECT room_id,host_player_id,guest_player_id,host_token_hash,guest_token_hash FROM rooms WHERE game_type='XIANGQI' AND room_code=?", strings.TrimSpace(code)).Scan(&id, &hostID, &guestID, &hostHash, &guestHash)
+	if e != nil {
+		return XiangqiSession{}, ErrNotFound
+	}
+	th := hashToken(token)
+	switch {
+	case hostHash == th:
+		snap, e := s.xiangqiSnapshot(ctx, id)
+		return XiangqiSession{id, snap.RoomCode, hostID, token, "RED", snap}, e
+	case guestID.Valid && guestHash == th:
+		snap, e := s.xiangqiSnapshot(ctx, id)
+		return XiangqiSession{id, snap.RoomCode, guestID.String, token, "BLACK", snap}, e
+	default:
+		return XiangqiSession{}, ErrNotFound
+	}
+}
 func (s *Service) xiangqiSnapshot(ctx context.Context, id string) (XiangqiSnapshot, error) {
 	var x XiangqiSnapshot
-	var guest, guestName, winner, board, last sql.NullString
-	e := s.db.QueryRowContext(ctx, "SELECT room_id,room_code,host_player_id,host_player_name,guest_player_id,guest_player_name,status,board_json,current_piece,move_count,revision,winner_player_id,last_move_json FROM rooms WHERE room_id=? AND game_type='XIANGQI'", id).Scan(&x.RoomID, &x.RoomCode, &x.HostPlayerID, &x.HostName, &guest, &guestName, &x.Status, &board, &x.CurrentTurn, &x.MoveCount, &x.Revision, &winner, &last)
+	var guest, guestName, winner, result, board, last, undo, pendingType, pendingPlayer sql.NullString
+	e := s.db.QueryRowContext(ctx, "SELECT room_id,room_code,host_player_id,host_player_name,guest_player_id,guest_player_name,status,board_json,current_piece,move_count,revision,winner_player_id,result,last_move_json,undo_snapshot_json,pending_action_type,pending_action_player_id FROM rooms WHERE room_id=? AND game_type='XIANGQI'", id).Scan(&x.RoomID, &x.RoomCode, &x.HostPlayerID, &x.HostName, &guest, &guestName, &x.Status, &board, &x.CurrentTurn, &x.MoveCount, &x.Revision, &winner, &result, &last, &undo, &pendingType, &pendingPlayer)
 	if e != nil {
 		return x, ErrNotFound
 	}
@@ -131,11 +173,27 @@ func (s *Service) xiangqiSnapshot(ctx context.Context, id string) (XiangqiSnapsh
 		}
 		x.Winner = &winningSide
 	}
+	if result.Valid {
+		x.Result = &result.String
+	}
 	if last.Valid && last.String != "null" {
 		var m XiangqiMove
 		if json.Unmarshal([]byte(last.String), &m) == nil {
 			x.LastMove = &m
 		}
+	}
+	x.undoSnapshot = undo.String
+	if undo.Valid && undo.String != "" && undo.String != "null" {
+		var history xiangqiUndoHistory
+		if json.Unmarshal([]byte(undo.String), &history) == nil {
+			for _, entry := range history.Moves {
+				x.RecentMovePlayers = append(x.RecentMovePlayers, entry.PlayerID)
+			}
+		}
+	}
+	x.CanUndo = len(x.RecentMovePlayers) > 0
+	if pendingType.Valid && pendingPlayer.Valid {
+		x.PendingAction = &PendingAction{Type: pendingType.String, RequestedByPlayerID: pendingPlayer.String}
 	}
 	return x, nil
 }
@@ -153,7 +211,7 @@ func (s *Service) PlayXiangqi(ctx context.Context, id, token string, revision in
 	if e != nil {
 		return x, e
 	}
-	if x.Revision != revision || x.Status != "IN_PROGRESS" {
+	if x.Revision != revision || x.Status != "IN_PROGRESS" || x.PendingAction != nil {
 		return x, ErrConflict
 	}
 	side := "BLACK"
@@ -171,6 +229,20 @@ func (s *Service) PlayXiangqi(ctx context.Context, id, token string, revision in
 	if !strings.HasPrefix(piece, side+"_") || piece == "" || !validXiangqiMove(x.Board, side, m) {
 		return x, ErrInvalid
 	}
+	beforeTurn := "BLACK"
+	if x.CurrentTurn == "RED" {
+		beforeTurn = "WHITE"
+	}
+	before := xiangqiUndoSnapshot{
+		Board:       append([]string(nil), x.Board...),
+		CurrentTurn: beforeTurn,
+		MoveCount:   x.MoveCount,
+		LastMove:    x.LastMove,
+	}
+	history := xiangqiUndoHistory{}
+	if x.undoSnapshot != "" && x.undoSnapshot != "null" {
+		_ = json.Unmarshal([]byte(x.undoSnapshot), &history)
+	}
 	captured := x.Board[idx(m.ToRow, m.ToColumn)]
 	x.Board[idx(m.ToRow, m.ToColumn)] = piece
 	x.Board[idx(m.FromRow, m.FromColumn)] = ""
@@ -184,10 +256,19 @@ func (s *Service) PlayXiangqi(ctx context.Context, id, token string, revision in
 	}
 	x.CurrentTurn = next
 	x.LastMove = &m
+	var winnerPID any
+	var result any
 	if captured == "BLACK_GENERAL" || captured == "RED_GENERAL" || !hasXiangqiMove(x.Board, next) {
 		x.Status = "FINISHED"
 		x.Winner = &side
+		winnerPID = playerForSide(x, side)
+		result = "WIN"
 	}
+	history.Moves = append(history.Moves, xiangqiMoveCheckpoint{Move: m, PlayerID: pid, Before: before})
+	if len(history.Moves) > 2 {
+		history.Moves = history.Moves[len(history.Moves)-2:]
+	}
+	undoJSON, _ := json.Marshal(history)
 	b, _ := json.Marshal(x.Board)
 	lm, _ := json.Marshal(m)
 	now := time.Now().UTC().Format(time.RFC3339Nano)
@@ -195,12 +276,7 @@ func (s *Service) PlayXiangqi(ctx context.Context, id, token string, revision in
 	if x.CurrentTurn == "RED" {
 		dbTurn = "WHITE"
 	}
-	res, e := s.db.ExecContext(ctx, "UPDATE rooms SET board_json=?,current_piece=?,move_count=?,revision=revision+1,status=?,winner_player_id=?,last_move_json=?,updated_at=? WHERE room_id=? AND game_type='XIANGQI' AND revision=?", string(b), dbTurn, x.MoveCount, x.Status, func() any {
-		if x.Winner != nil {
-			return playerForSide(x, *x.Winner)
-		}
-		return nil
-	}(), string(lm), now, id, revision)
+	res, e := s.db.ExecContext(ctx, "UPDATE rooms SET board_json=?,current_piece=?,move_count=?,revision=revision+1,status=?,winner_player_id=?,result=?,last_move_json=?,undo_snapshot_json=?,updated_at=? WHERE room_id=? AND game_type='XIANGQI' AND revision=?", string(b), dbTurn, x.MoveCount, x.Status, winnerPID, result, string(lm), string(undoJSON), now, id, revision)
 	if e != nil {
 		return x, e
 	}
@@ -220,32 +296,162 @@ func playerForSide(x XiangqiSnapshot, side string) string {
 	return ""
 }
 func (s *Service) XiangqiAction(ctx context.Context, id, token, action string, revision int64) (XiangqiSnapshot, error) {
+	switch action {
+	case "resign":
+		return s.xiangqiResign(ctx, id, token, revision)
+	case "restart":
+		return s.xiangqiRestart(ctx, id, token, revision)
+	case "request_undo":
+		return s.requestXiangqiAction(ctx, id, token, revision, "UNDO")
+	case "request_draw":
+		return s.requestXiangqiAction(ctx, id, token, revision, "DRAW")
+	case "accept_action":
+		return s.respondXiangqiAction(ctx, id, token, revision, true)
+	case "reject_action":
+		return s.respondXiangqiAction(ctx, id, token, revision, false)
+	default:
+		return XiangqiSnapshot{}, ErrInvalid
+	}
+}
+func (s *Service) xiangqiResign(ctx context.Context, id, token string, revision int64) (XiangqiSnapshot, error) {
 	x, pid, e := s.AuthorizedXiangqi(ctx, id, token)
+	if e != nil {
+		return x, e
+	}
+	if x.Revision != revision || x.Status != "IN_PROGRESS" || x.GuestPlayerID == nil {
+		return x, ErrConflict
+	}
+	side := "RED"
+	if pid == x.HostPlayerID {
+		side = "BLACK"
+	}
+	wp := playerForSide(x, side)
+	_, e = s.db.ExecContext(ctx, "UPDATE rooms SET status='FINISHED',winner_player_id=?,result='RESIGN',revision=revision+1,undo_snapshot_json='null',pending_action_type=NULL,pending_action_player_id=NULL,updated_at=? WHERE room_id=? AND revision=? AND status='IN_PROGRESS'", wp, time.Now().UTC().Format(time.RFC3339Nano), id, revision)
+	if e != nil {
+		return x, e
+	}
+	return s.xiangqiSnapshot(ctx, id)
+}
+func (s *Service) xiangqiRestart(ctx context.Context, id, token string, revision int64) (XiangqiSnapshot, error) {
+	x, _, e := s.AuthorizedXiangqi(ctx, id, token)
 	if e != nil {
 		return x, e
 	}
 	if x.Revision != revision {
 		return x, ErrConflict
 	}
-	if action == "resign" {
-		side := "RED"
-		if pid == x.HostPlayerID {
-			side = "BLACK"
-		}
-		wp := playerForSide(x, side)
-		_, e = s.db.ExecContext(ctx, "UPDATE rooms SET status='FINISHED',winner_player_id=?,result='RESIGN',revision=revision+1,updated_at=? WHERE room_id=? AND revision=?", wp, time.Now().UTC().Format(time.RFC3339Nano), id, revision)
+	board, _ := json.Marshal(initialXiangqi())
+	_, e = s.db.ExecContext(ctx, "UPDATE rooms SET board_json=?,current_piece='WHITE',move_count=0,status=CASE WHEN guest_player_id IS NULL THEN 'WAITING_FOR_OPPONENT' ELSE 'IN_PROGRESS' END,winner_player_id=NULL,result=NULL,last_move_json='null',undo_snapshot_json='null',pending_action_type=NULL,pending_action_player_id=NULL,revision=revision+1,updated_at=? WHERE room_id=? AND revision=?", string(board), time.Now().UTC().Format(time.RFC3339Nano), id, revision)
+	if e != nil {
+		return x, e
+	}
+	return s.xiangqiSnapshot(ctx, id)
+}
+func (s *Service) requestXiangqiAction(ctx context.Context, id, token string, revision int64, action string) (XiangqiSnapshot, error) {
+	x, pid, e := s.AuthorizedXiangqi(ctx, id, token)
+	if e != nil {
+		return x, e
+	}
+	if x.Revision != revision || x.Status != "IN_PROGRESS" || x.GuestPlayerID == nil || x.PendingAction != nil {
+		return x, ErrConflict
+	}
+	if action != "UNDO" && action != "DRAW" {
+		return x, ErrInvalid
+	}
+	if action == "UNDO" && !contains(x.RecentMovePlayers, pid) {
+		return x, ErrConflict
+	}
+	res, e := s.db.ExecContext(ctx, "UPDATE rooms SET pending_action_type=?,pending_action_player_id=?,revision=revision+1,updated_at=? WHERE room_id=? AND revision=? AND pending_action_type IS NULL AND guest_player_id IS NOT NULL", action, pid, time.Now().UTC().Format(time.RFC3339Nano), id, revision)
+	if e != nil {
+		return x, e
+	}
+	n, _ := res.RowsAffected()
+	if n != 1 {
+		return x, ErrConflict
+	}
+	return s.xiangqiSnapshot(ctx, id)
+}
+func (s *Service) respondXiangqiAction(ctx context.Context, id, token string, revision int64, accept bool) (XiangqiSnapshot, error) {
+	x, responderID, e := s.AuthorizedXiangqi(ctx, id, token)
+	if e != nil {
+		return x, e
+	}
+	if x.PendingAction == nil || x.Revision != revision || x.PendingAction.RequestedByPlayerID == responderID {
+		return x, ErrConflict
+	}
+	if !accept {
+		res, e := s.db.ExecContext(ctx, "UPDATE rooms SET pending_action_type=NULL,pending_action_player_id=NULL,revision=revision+1,updated_at=? WHERE room_id=? AND revision=? AND pending_action_player_id=?", time.Now().UTC().Format(time.RFC3339Nano), id, revision, x.PendingAction.RequestedByPlayerID)
 		if e != nil {
 			return x, e
 		}
+		n, _ := res.RowsAffected()
+		if n != 1 {
+			return x, ErrConflict
+		}
 		return s.xiangqiSnapshot(ctx, id)
 	}
-	if action != "restart" {
+	switch x.PendingAction.Type {
+	case "UNDO":
+		return s.undoXiangqiPlayer(ctx, id, x.PendingAction.RequestedByPlayerID, revision, x)
+	case "DRAW":
+		res, e := s.db.ExecContext(ctx, "UPDATE rooms SET status='FINISHED',winner_player_id=NULL,result='DRAW',revision=revision+1,undo_snapshot_json='null',pending_action_type=NULL,pending_action_player_id=NULL,updated_at=? WHERE room_id=? AND revision=? AND pending_action_type='DRAW'", time.Now().UTC().Format(time.RFC3339Nano), id, revision)
+		if e != nil {
+			return x, e
+		}
+		n, _ := res.RowsAffected()
+		if n != 1 {
+			return x, ErrConflict
+		}
+		return s.xiangqiSnapshot(ctx, id)
+	default:
 		return x, ErrInvalid
 	}
-	board, _ := json.Marshal(initialXiangqi())
-	_, e = s.db.ExecContext(ctx, "UPDATE rooms SET board_json=?,current_piece='WHITE',move_count=0,status=CASE WHEN guest_player_id IS NULL THEN 'WAITING_FOR_OPPONENT' ELSE 'IN_PROGRESS' END,winner_player_id=NULL,result=NULL,last_move_json='null',revision=revision+1,updated_at=? WHERE room_id=? AND revision=?", string(board), time.Now().UTC().Format(time.RFC3339Nano), id, revision)
+}
+func (s *Service) undoXiangqiPlayer(ctx context.Context, id, playerID string, revision int64, snap XiangqiSnapshot) (XiangqiSnapshot, error) {
+	if !snap.CanUndo || snap.Revision != revision {
+		return snap, ErrConflict
+	}
+	var raw string
+	if e := s.db.QueryRowContext(ctx, "SELECT undo_snapshot_json FROM rooms WHERE room_id=? AND revision=?", id, revision).Scan(&raw); e != nil {
+		return snap, ErrConflict
+	}
+	var history xiangqiUndoHistory
+	if e := json.Unmarshal([]byte(raw), &history); e != nil {
+		return snap, e
+	}
+	undoIndex := -1
+	for i := len(history.Moves) - 1; i >= 0; i-- {
+		if history.Moves[i].PlayerID == playerID {
+			undoIndex = i
+			break
+		}
+	}
+	if undoIndex < 0 {
+		return snap, ErrConflict
+	}
+	old := history.Moves[undoIndex].Before
+	if len(old.Board) != 90 {
+		return snap, ErrSnapshotCorrupt
+	}
+	board, _ := json.Marshal(old.Board)
+	last := "null"
+	if old.LastMove != nil {
+		b, _ := json.Marshal(old.LastMove)
+		last = string(b)
+	}
+	remaining := xiangqiUndoHistory{Moves: history.Moves[:undoIndex]}
+	remainingJSON := "null"
+	if len(remaining.Moves) > 0 {
+		b, _ := json.Marshal(remaining)
+		remainingJSON = string(b)
+	}
+	res, e := s.db.ExecContext(ctx, "UPDATE rooms SET status='IN_PROGRESS',board_json=?,current_piece=?,move_count=?,winner_player_id=NULL,result=NULL,last_move_json=?,undo_snapshot_json=?,pending_action_type=NULL,pending_action_player_id=NULL,revision=revision+1,updated_at=? WHERE room_id=? AND revision=? AND pending_action_type='UNDO'", string(board), old.CurrentTurn, old.MoveCount, last, remainingJSON, time.Now().UTC().Format(time.RFC3339Nano), id, revision)
 	if e != nil {
-		return x, e
+		return snap, e
+	}
+	n, _ := res.RowsAffected()
+	if n != 1 {
+		return snap, ErrConflict
 	}
 	return s.xiangqiSnapshot(ctx, id)
 }
@@ -294,9 +500,15 @@ func validXiangqiMove(b []string, side string, m XiangqiMove) bool {
 	dr, dc := tr-fr, tc-fc
 	adr, adc := abs(dr), abs(dc)
 	count := 0
-	for r, c := fr+sign(dr), fc+sign(dc); r != tr || c != tc; r, c = r+sign(dr), c+sign(dc) {
-		if r >= 0 && r < 10 && c >= 0 && c < 9 && b[r*9+c] != "" {
-			count++
+	// Only chariots, cannons and the flying-generals rule travel on a straight
+	// line. Stepping both row and column for a horse or elephant target can
+	// never reach that target and previously caused the WebSocket handler to
+	// loop forever while checking for check.
+	if dr == 0 || dc == 0 {
+		for r, c := fr+sign(dr), fc+sign(dc); r != tr || c != tc; r, c = r+sign(dr), c+sign(dc) {
+			if b[r*9+c] != "" {
+				count++
+			}
 		}
 	}
 	switch strings.TrimPrefix(p, side+"_") {

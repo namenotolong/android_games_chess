@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 	"strings"
 
@@ -25,10 +26,12 @@ func RegisterOnline(h *server.Hertz, s *game.Service, hub *game.Hub) {
 	a := &onlineAPI{s, hub}
 	h.POST("/api/v1/rooms", a.create)
 	h.POST("/api/v1/rooms/:code/join", a.join)
+	h.POST("/api/v1/rooms/:code/rejoin", a.rejoin)
 	h.GET("/api/v1/matches/:id", a.snapshot)
 	h.GET("/api/v1/ws", adaptor.HertzHandler(http.HandlerFunc(a.websocket)))
 	h.POST("/api/v1/xiangqi/rooms", a.createXiangqi)
 	h.POST("/api/v1/xiangqi/rooms/:code/join", a.joinXiangqi)
+	h.POST("/api/v1/xiangqi/rooms/:code/rejoin", a.rejoinXiangqi)
 }
 func body(c *app.RequestContext, v any) error { return json.Unmarshal(c.Request.Body(), v) }
 func (a *onlineAPI) create(ctx context.Context, c *app.RequestContext) {
@@ -93,6 +96,36 @@ func (a *onlineAPI) joinXiangqi(ctx context.Context, c *app.RequestContext) {
 	a.hub.Broadcast(x.RoomID, map[string]any{"type": "state", "match": x.Match})
 	c.JSON(200, x)
 }
+func (a *onlineAPI) rejoin(ctx context.Context, c *app.RequestContext) {
+	var r struct {
+		PlayerToken string `json:"playerToken"`
+	}
+	if body(c, &r) != nil || r.PlayerToken == "" {
+		c.JSON(400, utils.H{"error": "请求格式无效"})
+		return
+	}
+	x, e := a.s.Rejoin(ctx, string(c.Param("code")), r.PlayerToken)
+	if e != nil {
+		fail(c, e)
+		return
+	}
+	c.JSON(200, x)
+}
+func (a *onlineAPI) rejoinXiangqi(ctx context.Context, c *app.RequestContext) {
+	var r struct {
+		PlayerToken string `json:"playerToken"`
+	}
+	if body(c, &r) != nil || r.PlayerToken == "" {
+		c.JSON(400, utils.H{"error": "请求格式无效"})
+		return
+	}
+	x, e := a.s.RejoinXiangqi(ctx, string(c.Param("code")), r.PlayerToken)
+	if e != nil {
+		fail(c, e)
+		return
+	}
+	c.JSON(200, x)
+}
 func auth(c *app.RequestContext) string {
 	v := string(c.Request.Header.Peek("Authorization"))
 	return strings.TrimPrefix(v, "Bearer ")
@@ -140,7 +173,14 @@ func (a *onlineAPI) websocket(w http.ResponseWriter, r *http.Request) {
 	}
 	client := &game.Client{Conn: conn, PlayerID: pid}
 	a.hub.Add(id, client)
-	defer func() { a.hub.Remove(id, client); conn.Close() }()
+	a.hub.Broadcast(id, map[string]any{"type": "presence", "playerId": pid, "connected": true})
+	defer func() {
+		stillConnected := a.hub.Remove(id, client)
+		conn.Close()
+		if !stillConnected {
+			a.hub.Broadcast(id, map[string]any{"type": "presence", "playerId": pid, "connected": false})
+		}
+	}()
 	_ = client.WriteJSON(map[string]any{"type": "state", "match": snap})
 	for {
 		var msg struct {
@@ -188,7 +228,14 @@ func (a *onlineAPI) xiangqiWebsocket(w http.ResponseWriter, r *http.Request, id,
 	}
 	client := &game.Client{Conn: conn, PlayerID: pid}
 	a.hub.Add(id, client)
-	defer func() { a.hub.Remove(id, client); conn.Close() }()
+	a.hub.Broadcast(id, map[string]any{"type": "presence", "playerId": pid, "connected": true})
+	defer func() {
+		stillConnected := a.hub.Remove(id, client)
+		conn.Close()
+		if !stillConnected {
+			a.hub.Broadcast(id, map[string]any{"type": "presence", "playerId": pid, "connected": false})
+		}
+	}()
 	_ = client.WriteJSON(map[string]any{"type": "state", "match": snap})
 	for {
 		var msg struct {
@@ -202,6 +249,7 @@ func (a *onlineAPI) xiangqiWebsocket(w http.ResponseWriter, r *http.Request, id,
 		if conn.ReadJSON(&msg) != nil {
 			return
 		}
+		log.Printf("xiangqi message room=%s player=%s type=%s from=(%d,%d) to=(%d,%d) revision=%d", id, pid, msg.Type, msg.FromRow, msg.FromColumn, msg.ToRow, msg.ToColumn, msg.ExpectedRevision)
 		var next game.XiangqiSnapshot
 		if msg.Type == "move" {
 			next, e = a.s.PlayXiangqi(r.Context(), id, token, msg.ExpectedRevision, game.XiangqiMove{FromRow: msg.FromRow, FromColumn: msg.FromColumn, ToRow: msg.ToRow, ToColumn: msg.ToColumn})
@@ -209,9 +257,11 @@ func (a *onlineAPI) xiangqiWebsocket(w http.ResponseWriter, r *http.Request, id,
 			next, e = a.s.XiangqiAction(r.Context(), id, token, msg.Type, msg.ExpectedRevision)
 		}
 		if e != nil {
+			log.Printf("xiangqi rejected room=%s player=%s type=%s error=%v", id, pid, msg.Type, e)
 			_ = client.WriteJSON(map[string]any{"type": "error", "message": e.Error()})
 			continue
 		}
+		log.Printf("xiangqi updated room=%s revision=%d moves=%d status=%s turn=%s", id, next.Revision, next.MoveCount, next.Status, next.CurrentTurn)
 		a.hub.Broadcast(id, map[string]any{"type": "state", "match": next})
 	}
 }
